@@ -1,0 +1,882 @@
+--- substrate_v8.py
++++ substrate_v9.py
+@@ -1,14 +1,16 @@
+ #!/usr/bin/env python3
+ # SPDX-License-Identifier: CC0-1.0
+ """
+-Substrate v8 — Mammalian Autarky + Demurrage + Municipal Ledger (fixed)
+-=======================================================================
++Substrate v9 — Mammalian Autarky + Basic-Needs Pool + Attested Contributions
++============================================================================
+ 
+ Credit: humanity. Released to the public domain under CC0-1.0.
+ 
+ A single-file, standard-library Python reference implementation of a
+-proposed political economy. v8 is a corrected version of v7: see
+-README_v8.md for every change and the sources behind the pod model.
++proposed political economy. v8 corrected v7 (see README_v8.md); v9 adds
++an unconditional physical basic-needs pool and receipt-bound minting (see
++README_v9.md). A simulation/policy prototype, not deployed AGI, a financial
++product, or a guarantee that any resource exists.
+ 
+ Layers:
+   1. PodModel / HouseholdPod   parameterized cost, energy, water, calories
+@@ -17,8 +19,12 @@
+   3. LedgerClock + NeighborGraph + MeshConsensus
+                                system-owned clock, mutual registered
+                                neighbors, rolling-window and collusion caps
+-  4. AGIDataEngine             provenance-quality minting, per-person and
+-                               global per-period mint caps
++  4. ContributionEngine        (v8 AGIDataEngine) mints only against a mesh
++                               receipt; integer-cent per-person and
++                               mandatory global per-period caps
++  4b. BasicNeedsPool           physical food/water/energy/shelter shared
++                               equally by every active registered person,
++                               no work, data or credit condition
+   5. Demurrage                 threshold demurrage for every pod
+                                (plus idle decay) -> bounded balances
+   6. MunicipalZone / Ledger    ecological-fragility-scaled tolls
+@@ -40,18 +46,22 @@
+   - Personhood is unique within a registry (biometric matching is a
+     labeled simplification: real biometrics are fuzzy)
+   - Balances are bounded for any bounded inflow (threshold demurrage)
+-  - Minting is capped per person and globally per period
++  - Minting is capped per person and globally per period, and needs a
++    one-time quorum receipt bound to person, pod, domain, hours and time
++  - Basic-needs allocations never depend on work, data or TC balance
+   - The event log is public but pseudonymous by default
+ 
+ Run:
+-    python substrate_v8.py --test
+-    python substrate_v8.py --demo
+-    python substrate_v8.py --municipal-demo
+-    python substrate_v8.py --pod-report
++    python substrate_v9.py --test
++    python substrate_v9.py --demo
++    python substrate_v9.py --municipal-demo
++    python substrate_v9.py --pod-report
++    python substrate_v9.py --basic-needs
+ """
+ 
+ from __future__ import annotations
+ import argparse
++import copy
+ import hashlib
+ import hmac
+ import json
+@@ -60,8 +70,34 @@
+ import secrets
+ import sys
+ from dataclasses import dataclass, field
++from decimal import Decimal, ROUND_DOWN
+ from typing import Dict, FrozenSet, List, Optional, Set, Tuple
+ 
++SUBSTRATE_VERSION = "9.0"
++
++
++def _finite(value, name: str, minimum: float = 0, maximum: Optional[float] = None):
++    """v9 input check: a real, finite number in [minimum, maximum]."""
++    if isinstance(value, bool) or not isinstance(value, (int, float)):
++        raise ValueError(f"{name} must be numeric")
++    if not math.isfinite(value) or value < minimum:
++        raise ValueError(f"{name} must be finite and >= {minimum}")
++    if maximum is not None and value > maximum:
++        raise ValueError(f"{name} must be <= {maximum}")
++    return value
++
++
++def _integer(value, name: str, minimum: int = 0) -> int:
++    if type(value) is not int or value < minimum:
++        raise ValueError(f"{name} must be an integer >= {minimum}")
++    return value
++
++
++def _cents(value: float) -> int:
++    """Credits -> integer cents, rounded down (no float drift in caps)."""
++    _finite(value, "credits")
++    return int((Decimal(str(value)) * 100).to_integral_value(rounding=ROUND_DOWN))
++
+ 
+ # ===========================================================================
+ # 1a. PodModel — honest, parameterized cost / energy / water / calorie model
+@@ -565,9 +601,18 @@
+     """Neighbor attestation. v8: time comes from the LedgerClock, rate
+     limits use a rolling window, neighbors come from the NeighborGraph,
+     and two collusion caps apply per period: per (claimer, attestor) pair
+-    and per exact attestor set. RESIDUAL RISK: a ring of genuinely
+-    registered, mutually linked neighbors can still collude up to these
+-    caps; the caps bound the rate of fake minting, they do not detect it."""
++    and per exact attestor set.
++
++    v9: needs the PersonhoodRegistry. The claimer must be an active person
++    bound to the claiming pod, and only DISTINCT, active, bound, registered
++    neighbor pods count toward quorum (v8 counted [P1, P1, P1] as three
++    attestations). Every claim names a unique real-world `activity_id`. A met
++    quorum returns a random `claim_ref` receipt, held here, bound to person,
++    pod, domain, hours, polity and ledger hour; ContributionEngine mints only
++    against such a receipt (v8 minted without checking quorum at all).
++    RESIDUAL RISK: a ring of genuinely registered, mutually linked neighbors
++    can still collude up to these caps; relabeling one real activity under a
++    new activity_id is a semantic fraud this code cannot detect."""
+ 
+     def __init__(self, quorum: int = 3,
+                  rate_limit_per_hour: int = 2,
+@@ -577,20 +622,25 @@
+                  window_hours: int = 1,
+                  pair_cap_per_period: int = 4,
+                  set_cap_per_period: int = 3,
+-                 period_hours: int = 24):
+-        self.quorum = quorum
+-        self.rate_limit = rate_limit_per_hour
++                 period_hours: int = 24,
++                 registry: Optional[PersonhoodRegistry] = None):
++        self.quorum = _integer(quorum, "quorum", 1)
++        self.rate_limit = _integer(rate_limit_per_hour, "rate_limit_per_hour", 1)
+         self.neighbor_required = neighbor_required
+         self.clock = clock or LedgerClock()
+         self.graph = graph or NeighborGraph()
+-        self.window_hours = window_hours
+-        self.pair_cap = pair_cap_per_period
+-        self.set_cap = set_cap_per_period
+-        self.period_hours = period_hours
++        self.registry = registry
++        self.window_hours = _integer(window_hours, "window_hours", 1)
++        self.pair_cap = _integer(pair_cap_per_period, "pair_cap_per_period", 1)
++        self.set_cap = _integer(set_cap_per_period, "set_cap_per_period", 1)
++        self.period_hours = _integer(period_hours, "period_hours", 1)
+         self._attestation_log: Dict[str, List[Tuple[int, str]]] = {}
+         self._pair_log: Dict[Tuple[str, str], List[int]] = {}
+         self._set_log: Dict[FrozenSet[str], List[int]] = {}
+         self._nonce = 0
++        self._claims: Dict[str, Dict] = {}      # claim_ref -> bound receipt
++        self._activity_ids: Set[str] = set()
++        self._consumed: Set[str] = set()
+ 
+     @staticmethod
+     def _sig(pod_id: str, claim_id: str) -> str:
+@@ -600,20 +650,57 @@
+         now = self.clock.hour
+         return sum(1 for t in times if now - t < span)
+ 
++    def _prune(self, now: int) -> None:
++        """v9: drop log entries no window can count any more (v8 lists grew
++        forever, making every claim slower)."""
++        keep = max(self.window_hours, self.period_hours)
++        for log in self._attestation_log.values():
++            log[:] = [e for e in log if now - e[0] < keep]
++        for logs in (self._pair_log, self._set_log):
++            for times in logs.values():
++                times[:] = [t for t in times if now - t < keep]
++
++    def valid_pod(self, pod: HouseholdPod) -> bool:
++        """Active registered person, bound to exactly this pod, pod in graph."""
++        reg = self.registry
++        return bool(reg is not None and reg.is_active_member(pod.person_id)
++                    and reg._pod_bindings.get(pod.person_id) == pod.node_id
++                    and pod.node_id in self.graph.registered)
++
+     def register(self, claimer: HouseholdPod, domain: str,
+                  hours: float, peers: List[HouseholdPod],
+-                 hour: Optional[int] = None) -> Dict:
++                 hour: Optional[int] = None, *,
++                 activity_id: Optional[str] = None) -> Dict:
+         """`hour` is accepted for v7 API compatibility and IGNORED."""
+-        now = self.clock.hour
++        _finite(hours, "hours", 1e-12, 24)
++        now = _integer(self.clock.hour, "clock hour")
++        if not isinstance(domain, str) or not domain.strip():
++            raise ValueError("activity domain required")
++        if not isinstance(activity_id, str) or not activity_id.strip():
++            raise ValueError("unique real-world activity_id required")
++        if self.registry is None:
++            raise ValueError("MeshConsensus needs a PersonhoodRegistry")
++        if not self.valid_pod(claimer):
++            raise ValueError("claimer must be an active person bound to this pod")
++        if activity_id in self._activity_ids:
++            raise ValueError("activity already attested")
++        self._prune(now)
+         self._nonce += 1
+         claim_id = hashlib.sha256(
+             f"{claimer.node_id}|{domain}|{hours}|{now}|{self._nonce}".encode()
+         ).hexdigest()[:12]
+-        accepted, rejected = [], []
++        accepted, rejected, seen = [], [], set()
+         for peer in peers:
+             if peer.node_id == claimer.node_id:
+                 rejected.append((peer.node_id, "self-attestation"))
+                 continue
++            if peer.node_id in seen:
++                rejected.append((peer.node_id, "duplicate peer"))
++                continue
++            seen.add(peer.node_id)
++            if not self.valid_pod(peer):
++                rejected.append((peer.node_id, "inactive or unbound pod"))
++                continue
+             if self.neighbor_required and not self.graph.are_neighbors(
+                     claimer.node_id, peer.node_id):
+                 rejected.append((peer.node_id, "not a registered mutual neighbor"))
+@@ -638,15 +725,29 @@
+             self._pair_log.setdefault((claimer.node_id, p), []).append(now)
+         if accepted:
+             self._set_log.setdefault(aset, []).append(now)
+-        return {
++        result = {
+             "claim_id": claim_id,
+             "hour": now,
++            "activity_id": activity_id,
+             "accepted": accepted,
+             "rejected": rejected,
+             "quorum_met": len(accepted) >= self.quorum,
+             "needed": self.quorum,
+             "sigs": [self._sig(p, claim_id) for p in accepted],
+         }
++        if result["quorum_met"]:
++            # random reference held by the mesh: callers cannot forge it
++            # from public fields, and the stored copy is what gets checked
++            token = secrets.token_hex(24)
++            self._claims[token] = {
++                "claim_id": claim_id, "pod_id": claimer.node_id,
++                "person_id": claimer.person_id, "domain": domain,
++                "hours": hours, "hour": now, "polity": claimer.polity,
++                "activity_id": activity_id, "attestors": tuple(accepted),
++                "quorum": self.quorum}
++            self._activity_ids.add(activity_id)
++            result["claim_ref"] = token
++        return result
+ 
+ # ===========================================================================
+ # 3b. CaloriePlanner — goal-weight demand feeding the pod model
+@@ -1003,7 +1104,7 @@
+                                         "day": day})
+ 
+ # ===========================================================================
+-# 6. AGIDataEngine
++# 6. ProvenanceEvidence + ContributionEngine (v8: AGIDataEngine)
+ # ===========================================================================
+ @dataclass
+ class ProvenanceEvidence:
+@@ -1011,7 +1112,11 @@
+     sensors minted more. v8 scores provenance QUALITY: variance inside a
+     plausible band scores 1.0; too flat (possible replay/synthetic) or too
+     noisy scores lower. The band is an ASSUMPTION to be calibrated per
+-    sensor type."""
++    sensor type. v9: the score is called provenance_score (it was never
++    entropy); inputs are validated; inside ContributionEngine the band and
++    the attestation count come from the engine and the mesh receipt, not
++    from the claimant. Not proof of human work, truth, social worth or a
++    calibrated probability."""
+     sensor_variance: float
+     quorum_attestations: int
+     quorum_required: int = 3
+@@ -1034,10 +1139,20 @@
+         return max(0.0, 1.0 - (v - hi) / hi)
+ 
+     @property
+-    def combined_entropy(self) -> float:
+-        """Name kept for API compatibility; now a provenance score."""
++    def provenance_score(self) -> float:
++        _finite(self.sensor_variance, "sensor variance")
++        _finite(self.plausible_low, "plausible low", 1e-12)
++        _finite(self.plausible_high, "plausible high", self.plausible_low)
++        _integer(self.quorum_attestations, "attestations")
++        _integer(self.quorum_required, "quorum", 1)
+         return 0.6 * self.quality + 0.4 * self.quorum_score
+ 
++    @property
++    def combined_entropy(self) -> float:
++        """Deprecated v7/v8 name; alias of provenance_score. Not physical
++        or information entropy."""
++        return self.provenance_score
++
+ 
+ @dataclass
+ class MammalianActivity:
+@@ -1052,7 +1167,18 @@
+     metadata: Dict = field(default_factory=dict)
+ 
+ 
+-class AGIDataEngine:
++class ContributionEngine:
++    """Mints TC for attested contributions (v8 name: AGIDataEngine, kept as
++    an alias). v9 mints ONLY against a MeshConsensus receipt
++    (activity.metadata["claim_ref"]) from a mesh sharing this engine's
++    registry, and rejects: missing, forged, mismatched, replayed or expired
++    receipts; inactive or unbound claimants or attestors; unknown domains
++    (v8 gave them weight 1.0); more than 24 credited hours per person per
++    workday; a `day` that differs from the ledger clock. A receipt is
++    evaluated once: after it matches, any outcome consumes it, so a
++    claimant cannot retry with tweaked sensor numbers. Caps are integer
++    cents, rounded down. The global cap is mandatory; its 60,000 TC per
++    period default is a POLICY ASSUMPTION, not a calibrated result."""
+     DEFAULT_DOMAIN_WEIGHTS = {
+         "community_care":     1.50,
+         "permaculture":       1.30,
+@@ -1061,83 +1187,238 @@
+         "craft":              1.15,
+         "synthetic_spam":     0.00,
+     }
++    DEFAULT_GLOBAL_CAP = 60_000.0          # policy assumption, see docstring
+ 
+     def __init__(self, base_rate_per_hour: float = 12.0,
+-                 entropy_threshold: float = 0.75,
++                 entropy_threshold: Optional[float] = None,
+                  consensus_floor: float = 0.60,
+                  un_recognition: Optional[UNRecognition] = None,
+                  transparency_log: Optional[TransparencyLog] = None,
+                  period_days: int = 30,
+                  person_cap_per_period: float = 600.0,
+-                 global_cap_per_period: Optional[float] = None):
+-        self.base_rate = base_rate_per_hour
+-        self.entropy_threshold = entropy_threshold
+-        self.consensus_floor = consensus_floor
++                 global_cap_per_period: Optional[float] = DEFAULT_GLOBAL_CAP,
++                 *, mesh: Optional[MeshConsensus] = None,
++                 registry: Optional[PersonhoodRegistry] = None,
++                 provenance_threshold: Optional[float] = None,
++                 max_claim_age_hours: int = 24,
++                 plausible_variance_band: Tuple[float, float] = (0.05, 0.60)):
++        if provenance_threshold is not None and entropy_threshold is not None:
++            raise ValueError("use only provenance_threshold")
++        threshold = (provenance_threshold if provenance_threshold is not None
++                     else entropy_threshold if entropy_threshold is not None
++                     else 0.75)
++        if global_cap_per_period is None:
++            raise ValueError("a finite global cap is required")
++        self.base_rate = _finite(base_rate_per_hour, "base rate")
++        self.provenance_threshold = _finite(threshold, "threshold", 0, 1 - 1e-12)
++        self.consensus_floor = _finite(consensus_floor, "consensus floor", 0, 1)
+         self.domain_weights = dict(self.DEFAULT_DOMAIN_WEIGHTS)
+         self.un = un_recognition
+         self.log = transparency_log
+-        self.period_days = period_days
+-        self.person_cap = person_cap_per_period
+-        self.global_cap = global_cap_per_period
+-        self._minted: Dict[Tuple[int, str], float] = {}
++        self.period_days = _integer(period_days, "period days", 1)
++        self.person_cap = _finite(person_cap_per_period, "person cap")
++        self.global_cap = _finite(global_cap_per_period, "global cap")
++        self.mesh, self.registry = mesh, registry
++        self.max_claim_age_hours = _integer(max_claim_age_hours, "claim age", 1)
++        lo, hi = plausible_variance_band
++        self.variance_band = (_finite(lo, "variance low", 1e-12),
++                              _finite(hi, "variance high", lo))
++        self._person_cents: Dict[Tuple[int, str], int] = {}
++        self._global_cents: Dict[int, int] = {}
++        self._daily_hours: Dict[Tuple[int, str], float] = {}
++        self._minted: Dict[Tuple[int, str], float] = {}      # TC view, compat
+         self._minted_global: Dict[int, float] = {}
+ 
++    @property
++    def entropy_threshold(self) -> float:
++        """Deprecated alias of provenance_threshold."""
++        return self.provenance_threshold
++
+     def minted_in_period(self, who: str, day: int) -> float:
+-        return self._minted.get((day // self.period_days, who), 0.0)
++        _integer(day, "day")
++        return self._person_cents.get((day // self.period_days, who), 0) / 100
++
++    def _active_pods(self) -> Set[str]:
++        reg = self.registry
++        return {pod for pid, pod in reg._pod_bindings.items()
++                if reg.is_active_member(pid)}
+ 
+     def evaluate_and_mint(self, activity: MammalianActivity,
+-                          day: int = 0) -> Tuple[float, Optional[str]]:
++                          day: Optional[int] = None
++                          ) -> Tuple[float, Optional[str]]:
++        dom = activity.domain
++        if (self.mesh is None or self.registry is None
++                or self.mesh.registry is not self.registry):
++            return 0.0, "REJECTED: trusted mesh and shared registry required"
++        now = _integer(self.mesh.clock.hour, "clock hour")
++        today = now // 24
++        if day is not None and (type(day) is not int or day != today):
++            return 0.0, "REJECTED: day must match ledger clock"
++        meta = activity.metadata if isinstance(activity.metadata, dict) else {}
++        token = meta.get("claim_ref")
++        if not isinstance(token, str):
++            return 0.0, f"REJECTED [{dom}]: quorum receipt required"
++        claim = self.mesh._claims.get(token)
++        if claim is None or token in self.mesh._consumed:
++            return 0.0, f"REJECTED [{dom}]: unknown or already used receipt"
++        if not 0 <= now - claim["hour"] <= self.max_claim_age_hours:
++            return 0.0, f"REJECTED [{dom}]: expired or future receipt"
++        if any(getattr(activity, f) != claim[f]
++               for f in ("person_id", "pod_id", "domain", "polity")):
++            return 0.0, f"REJECTED [{dom}]: receipt does not match activity"
++        _finite(activity.hours_logged, "hours", 1e-12, 24)
++        _finite(activity.peer_consensus_rating, "rating", 0, 1)
++        if activity.hours_logged != claim["hours"]:
++            return 0.0, f"REJECTED [{dom}]: attested hours mismatch"
++        pid = activity.person_id
++        if (not self.registry.is_active_member(pid)
++                or self.registry._pod_bindings.get(pid) != activity.pod_id):
++            return 0.0, f"REJECTED [{dom}]: inactive or unbound person"
++        if not set(claim["attestors"]) <= (self._active_pods()
++                                           & self.mesh.graph.registered):
++            return 0.0, f"REJECTED [{dom}]: an attestor is no longer active"
++        weight = self.domain_weights.get(dom)
++        if weight is None or _finite(weight, "domain weight") <= 0:
++            return 0.0, f"REJECTED [{dom}]: unsupported contribution domain"
++
++        # The receipt matched: from here on it is consumed whatever happens.
++        self.mesh._consumed.add(token)
+         if self.un is not None:
+-            check = self.un.check_activity(activity.domain,
+-                                           activity.metadata,
++            check = self.un.check_activity(dom, {**meta, "day": today},
+                                            polity=activity.polity or None)
+             if check["status"] == "REJECT":
+                 if self.log:
+                     self.log.append("un_reject", {
+-                        "pod_id": activity.pod_id,
+-                        "domain": activity.domain,
+-                        "prohibition": check["prohibition"]}, day)
++                        "pod_id": activity.pod_id, "domain": dom,
++                        "prohibition": check["prohibition"]}, today)
+                 return 0.0, (f"REJECTED [UN {check['prohibition']}]: "
+                              f"{check['reason']}")
+-
+-        entropy = activity.provenance.combined_entropy
+-        if entropy < self.entropy_threshold:
+-            return 0.0, (f"REJECTED [{activity.domain}]: provenance "
+-                         f"{entropy:.2f} < {self.entropy_threshold:.2f}")
+-
++        # engine-owned band; attestation count from the stored receipt
++        verified = ProvenanceEvidence(activity.provenance.sensor_variance,
++                                      len(claim["attestors"]), claim["quorum"],
++                                      *self.variance_band)
++        score = verified.provenance_score
++        if score < self.provenance_threshold:
++            return 0.0, (f"REJECTED [{dom}]: provenance "
++                         f"{score:.2f} < {self.provenance_threshold:.2f}")
+         if activity.peer_consensus_rating < self.consensus_floor:
+-            return 0.0, (f"REJECTED [{activity.domain}]: consensus "
++            return 0.0, (f"REJECTED [{dom}]: consensus "
+                          f"{activity.peer_consensus_rating:.2f} < "
+                          f"{self.consensus_floor:.2f}")
+-
+-        entropy_multiplier = (
+-            1.0 + (entropy - self.entropy_threshold) /
+-            (1.0 - self.entropy_threshold)
+-        )
+-        domain_weight = self.domain_weights.get(activity.domain, 1.0)
+-        minted = (activity.hours_logged * self.base_rate *
+-                  entropy_multiplier * domain_weight *
+-                  activity.peer_consensus_rating)
+-        # per-period caps
+-        period = day // self.period_days
+-        who = activity.person_id or activity.pod_id or "?"
+-        room = self.person_cap - self._minted.get((period, who), 0.0)
+-        if self.global_cap is not None:
+-            room = min(room, self.global_cap - self._minted_global.get(period, 0.0))
+-        capped = minted > room
+-        minted = max(0.0, min(minted, room))
+-        minted = round(minted, 2)
+-        if minted <= 0:
+-            return 0.0, f"REJECTED [{activity.domain}]: mint cap reached"
+-        self._minted[(period, who)] = self._minted.get((period, who), 0.0) + minted
+-        self._minted_global[period] = self._minted_global.get(period, 0.0) + minted
++        hkey = (claim["hour"] // 24, pid)
++        if self._daily_hours.get(hkey, 0.0) + activity.hours_logged > 24:
++            return 0.0, f"REJECTED [{dom}]: credited hours would exceed 24 that day"
++        multiplier = (1.0 + (score - self.provenance_threshold) /
++                      (1.0 - self.provenance_threshold))
++        requested = _cents(activity.hours_logged * self.base_rate * multiplier
++                           * weight * activity.peer_consensus_rating)
++        period = today // self.period_days
++        key = (period, pid)
++        room = min(_cents(self.person_cap) - self._person_cents.get(key, 0),
++                   _cents(self.global_cap) - self._global_cents.get(period, 0))
++        granted = max(0, min(requested, room))
++        if granted == 0:
++            return 0.0, f"REJECTED [{dom}]: mint cap reached or sub-cent award"
++        self._person_cents[key] = self._person_cents.get(key, 0) + granted
++        self._global_cents[period] = self._global_cents.get(period, 0) + granted
++        self._daily_hours[hkey] = self._daily_hours.get(hkey, 0.0) + activity.hours_logged
++        self._minted[key] = self._person_cents[key] / 100
++        self._minted_global[period] = self._global_cents[period] / 100
+         if self.log:
+             self.log.append("mint", {
+-                "pod_id": activity.pod_id, "domain": activity.domain,
++                "pod_id": activity.pod_id, "domain": dom,
+                 "hours": activity.hours_logged,
+-                "provenance": round(entropy, 3),
+-                "minted": minted, "capped": capped}, day)
+-        return minted, None
++                "provenance": round(score, 3),
++                "minted": granted / 100, "capped": granted < requested}, today)
++        return granted / 100, None
++
++
++AGIDataEngine = ContributionEngine     # v8 name, kept for compatibility
++
++
++# ===========================================================================
++# 6b. BasicNeedsPool (v9) — physical basics, separate from TC
++# ===========================================================================
++class BasicNeedsPool:
++    """Physical inventory, accounted separately from TC, in four integer
++    units: food kcal, water ml, energy Wh and shelter person-days. Every
++    active registered person gets an equal share each ledger day. It never
++    looks at work, sensor data, contribution scores, sponsors, pods or TC
++    balances. Integer remainders rotate between people by day; shortages
++    are reported, not hidden.
++
++    Limits (labeled): daily targets are caller-chosen policy numbers, NOT
++    nutrition, medical or engineering advice; calories are not a complete
++    diet; deposits must be supplies actually available net of production
++    and infrastructure use; shelter person-days are available capacity,
++    not new housing; an allocation record is NOT proof that goods reached
++    anyone. Equal-per-person is illustrative; a real system needs
++    needs-based accommodations, emergency priorities and appeals. Being in
++    the registry is still an administrative gate. Spoilage, procurement,
++    grid dispatch, water safety and occupancy are not modeled."""
++    UNITS = ("food_kcal", "water_ml", "energy_wh", "shelter_person_days")
++
++    def __init__(self, registry: PersonhoodRegistry, clock: LedgerClock,
++                 daily_targets: Dict[str, int]):
++        self.registry, self.clock = registry, clock
++        self.targets = self._basket(daily_targets)
++        self._stock = dict.fromkeys(self.UNITS, 0)
++        self._deposits: Dict[str, Dict] = {}
++        self._days: Dict[int, Dict] = {}
++
++    @classmethod
++    def _basket(cls, basket: Dict[str, int]) -> Dict[str, int]:
++        if set(basket) != set(cls.UNITS):
++            raise ValueError("provide exactly the four resource units")
++        return {k: _integer(basket[k], k) for k in cls.UNITS}
++
++    @property
++    def inventory(self) -> Dict[str, int]:
++        return dict(self._stock)
++
++    def deposit(self, receipt_id: str, basket: Dict[str, int],
++                source: str) -> None:
++        if not isinstance(receipt_id, str) or not receipt_id.strip():
++            raise ValueError("supply receipt ID required")
++        if not isinstance(source, str) or not source.strip():
++            raise ValueError("supply source label required")
++        basket = self._basket(basket)
++        if receipt_id in self._deposits:
++            raise ValueError("duplicate supply receipt")
++        self._deposits[receipt_id] = {"basket": basket, "source": source}
++        for k, v in basket.items():
++            self._stock[k] += v
++
++    def allocate_today(self) -> Dict:
++        """Once per ledger day; later calls return a copy of the same record."""
++        day = _integer(self.clock.hour, "clock hour") // 24
++        if day in self._days:
++            return copy.deepcopy(self._days[day])
++        people = sorted(pid for pid in self.registry.persons
++                        if self.registry.is_active_member(pid))
++        if not people:
++            return {"day": day, "status": "NO_RESIDENTS", "allocations": {}}
++        offset = day % len(people)          # rotate remainder priority
++        people = people[offset:] + people[:offset]
++        n = len(people)
++        allocations: Dict[str, Dict[str, int]] = {p: {} for p in people}
++        shortfall, used = {}, {}
++        for res in self.UNITS:
++            required = self.targets[res] * n
++            available = min(self._stock[res], required)
++            q, r = divmod(available, n)
++            for i, person in enumerate(people):
++                allocations[person][res] = q + int(i < r)
++            used[res] = available
++            shortfall[res] = required - available
++            self._stock[res] -= available
++        result = {"day": day,
++                  "status": "SHORTFALL" if any(shortfall.values()) else "ALLOCATED",
++                  "allocations": allocations, "shortfall": shortfall,
++                  "used": used, "remaining": self.inventory,
++                  "note": "allocation record, not verified delivery"}
++        self._days[day] = copy.deepcopy(result)
++        return result
+ 
+ 
+ # ===========================================================================
+@@ -1673,7 +1954,7 @@
+ 
+ def demo() -> None:
+     print("=" * 88)
+-    print("SUBSTRATE v8 — FULL STACK DEMO   (Credit: humanity)")
++    print("SUBSTRATE v9 — FULL STACK DEMO   (Credit: humanity)")
+     print("=" * 88)
+ 
+     rng, registry, pods = _setup()
+@@ -1682,44 +1963,80 @@
+     graph = NeighborGraph()
+     for p in pods:
+         graph.register_pod(p.node_id)
++    # v9: each pod links to the next two around the ring (4 neighbors), so
++    # a quorum of 3 is reachable. v8 linked only the next one (2 neighbors)
++    # and still minted, because v8 never checked quorum_met.
+     for i, p in enumerate(pods):
+-        graph.link(p.node_id, pods[(i + 1) % len(pods)].node_id)
++        for k in (1, 2):
++            graph.link(p.node_id, pods[(i + k) % len(pods)].node_id)
+         p.polity = POLITY
+     mesh = MeshConsensus(quorum=3, rate_limit_per_hour=4, clock=clock,
+-                         graph=graph)
++                         graph=graph, registry=registry)
+     un = UNRecognition(signatories=["KR", "JP", "SG"])
+     un.recognize(POLITY)
+-    agi = AGIDataEngine(un_recognition=un, transparency_log=log)
++    agi = ContributionEngine(un_recognition=un, transparency_log=log,
++                             mesh=mesh, registry=registry)
+ 
+     print(f"\n[0] PERSONHOOD: genesis quorum 3, then 2 distinct sponsors each; "
+           f"{len(registry.persons)} persons")
+     r = registry.register("px", "biox", sponsors=["p0", "p0"], day=0)
+     print(f"  duplicate vouch ['p0','p0']: {r['status']} ({r['reason']})")
+ 
+-    print("\n[1] MINTING (ledger clock, mutual neighbors, provenance quality)")
+-    for i, pod in enumerate(pods):
+-        clock.advance(1)
+-        peers = [q for q in pods if graph.are_neighbors(pod.node_id, q.node_id)]
+-        att = mesh.register(pod, "community_care", 6.0, peers)
+-        prov = ProvenanceEvidence(sensor_variance=0.30,
+-                                  quorum_attestations=len(att["accepted"]))
++    print("\n[1] MINTING (ledger clock, mutual neighbors, one-time quorum receipts)")
++    def claim(pod, act_id, variance=0.30, peers=None):
++        peers = peers if peers is not None else [
++            q for q in pods if graph.are_neighbors(pod.node_id, q.node_id)]
++        att = mesh.register(pod, "community_care", 6.0, peers, activity_id=act_id)
++        meta = {"claim_ref": att["claim_ref"]} if att["quorum_met"] else {}
+         act = MammalianActivity(
+             domain="community_care", description="elder care",
+-            hours_logged=6.0, provenance=prov, peer_consensus_rating=0.90,
+-            pod_id=pod.node_id, person_id=pod.person_id, polity=POLITY)
+-        credits, err = agi.evaluate_and_mint(act, day=1)
++            hours_logged=6.0, provenance=ProvenanceEvidence(variance, len(att["accepted"])),
++            peer_consensus_rating=0.90, pod_id=pod.node_id,
++            person_id=pod.person_id, polity=pod.polity, metadata=meta)
++        return att, act
++    for i, pod in enumerate(pods):
++        clock.advance(1)
++        att, act = claim(pod, f"care-visit-{i}")
++        credits, err = agi.evaluate_and_mint(act)
+         if err:
+             print(f"  [-] {pod.node_id}: {err}")
+         else:
+             pod.credit(credits)
+             print(f"  [+] {pod.node_id}: minted {credits:.2f} TC "
+-                  f"(provenance {prov.combined_entropy:.3f}, "
+-                  f"quorum {len(att['accepted'])}/{att['needed']})")
+-    noisy = ProvenanceEvidence(sensor_variance=0.92, quorum_attestations=2)
+-    _, err = agi.evaluate_and_mint(MammalianActivity(
+-        "community_care", "noisy sensor", 6.0, noisy, 0.9,
+-        pod_id=pods[0].node_id, person_id=pods[0].person_id), day=1)
+-    print(f"  [-] implausibly noisy sensor (v7 rewarded this): {err}")
++                  f"(quorum {len(att['accepted'])}/{att['needed']}, receipt checked)")
++    _, err = agi.evaluate_and_mint(act)
++    print(f"  [-] same receipt again (replay): {err}")
++    att, _ = claim(pods[0], "dup-peer-test", peers=[pods[1]] * 3)
++    print(f"  [-] one neighbor listed 3x (v8 counted 3): accepted "
++          f"{att['accepted']} quorum_met={att['quorum_met']}")
++    forged = MammalianActivity("community_care", "made-up receipt", 6.0,
++                               ProvenanceEvidence(0.3, 3), 0.9, pods[0].node_id,
++                               pods[0].person_id, POLITY, {"claim_ref": "made-up"})
++    print(f"  [-] forged receipt: {agi.evaluate_and_mint(forged)[1]}")
++    _, noisy = claim(pods[0], "noisy-sensor-visit", variance=0.92)
++    print(f"  [-] implausibly noisy sensor (v7 rewarded this): "
++          f"{agi.evaluate_and_mint(noisy)[1]}")
++
++    print("\n[1b] BASIC NEEDS (physical supplies, equal per person, no work/credit test)")
++    targets = dict(food_kcal=2500, water_ml=20000, energy_wh=4000,
++                   shelter_person_days=1)
++    print(f"  daily targets (illustrative policy numbers, not advice): {targets}")
++    basics = BasicNeedsPool(registry, clock, targets)
++    n = sum(1 for p in registry.persons if registry.is_active_member(p))
++    basics.deposit("delivery-day0", {k: v * n for k, v in targets.items()},
++                   "synthetic demo inventory, not observed supply")
++    day0 = basics.allocate_today()
++    earner = pods[0]
++    print(f"  day {day0['day']}: {day0['status']} for {n} people")
++    print(f"    {earner.person_id} (earned TC, balance {earner.transit_credit_balance:.2f}): "
++          f"{day0['allocations'][earner.person_id]}")
++    print(f"    p0 (no pod, no earnings): {day0['allocations']['p0']}")
++    clock.advance(24)
++    basics.deposit("delivery-day1", {k: v * n // 2 for k, v in targets.items()},
++                   "synthetic half delivery")
++    day1 = basics.allocate_today()
++    print(f"  day {day1['day']}: {day1['status']} (half delivery) -> each gets "
++          f"{day1['allocations']['p0']}; shortfall {day1['shortfall']}")
+ 
+     print("\n[2] DEMURRAGE (idle 4% + 10% on balance above 500 TC, everyone)")
+     active, idle = pods[0], pods[1]
+@@ -1832,7 +2149,7 @@
+     print(f"  aggregate: {log.aggregate_report()}")
+     print(f"  total transparency events: {len(log.events)}")
+ 
+-    print("\n[11] POD MODEL (sourced + labeled assumptions; see README_v8.md)")
++    print("\n[11] POD MODEL (sourced + labeled assumptions; see README_v8.md, unchanged in v9)")
+     pod_report()
+ 
+     print("\n[12] GOAL-WEIGHT CALORIE PLAN -> POD DEMAND (general guidance, not medical advice)")
+@@ -1848,6 +2165,66 @@
+     print(f"  total TC in pods: {sum(p.transit_credit_balance for p in pods):.2f}")
+ 
+ 
++def _toy_world(n: int = 4, polity: str = "Demo"):
++    """n registered people, one bound pod each; pod-0 is a mutual neighbor of
++    every other pod. Returns (registry, clock, graph, pods)."""
++    registry = PersonhoodRegistry(pepper=b"toy-pepper-not-secret")
++    members = [(f"person-{i}", f"toy-bio-{i}") for i in range(n)]
++    if registry.register_genesis(members)["status"] != "GENESIS":
++        raise ValueError("toy genesis failed")
++    clock, graph, pods = LedgerClock(), NeighborGraph(), []
++    for i, (pid, _) in enumerate(members):
++        pod = HouseholdPod(f"pod-{i}", person_id=pid, polity=polity)
++        registry.bind_pod(pid, pod.node_id)
++        graph.register_pod(pod.node_id)
++        pods.append(pod)
++    for pod in pods[1:]:
++        graph.link(pods[0].node_id, pod.node_id)
++    return registry, clock, graph, pods
++
++
++def basic_needs_exercise() -> Dict:
++    """v9 integration check on the real classes: one person earns credits,
++    nobody else works, everyone gets identical basic supplies; the next day
++    with no delivery is reported as a shortfall."""
++    registry, clock, graph, pods = _toy_world(4)
++    mesh = MeshConsensus(registry=registry, clock=clock, graph=graph)
++    dup = mesh.register(pods[0], "community_care", 1, [pods[1]] * 3,
++                        activity_id="duplicate-peer-test")
++    _check(not dup["quorum_met"], "duplicate peers must not make quorum")
++    clock.advance(1)
++    receipt = mesh.register(pods[0], "community_care", 1, pods[1:],
++                            activity_id="care-1")
++    activity = MammalianActivity("community_care", "demo care", 1,
++                                 ProvenanceEvidence(0.3, 999), 1.0,
++                                 pods[0].node_id, pods[0].person_id, "Demo",
++                                 {"claim_ref": receipt["claim_ref"]})
++    engine = ContributionEngine(mesh=mesh, registry=registry)
++    amount, err = engine.evaluate_and_mint(activity)
++    _check(err is None and amount == 36.0, f"expected 36.0, got {amount} {err}")
++    _check(engine.evaluate_and_mint(activity)[0] == 0, "replay refused")
++    pods[0].credit(amount)
++    targets = dict(food_kcal=2500, water_ml=20000, energy_wh=4000,
++                   shelter_person_days=1)
++    pool = BasicNeedsPool(registry, clock, targets)
++    pool.deposit("demo-delivery", {k: v * 4 for k, v in targets.items()},
++                 "synthetic test inventory; not observed supply")
++    day0 = pool.allocate_today()
++    _check(day0["status"] == "ALLOCATED", "day 0 allocated")
++    _check(day0["allocations"][pods[0].person_id]
++           == day0["allocations"][pods[3].person_id], "equal basics")
++    _check(pool.allocate_today() == day0, "once per day")
++    clock.advance(24)
++    day1 = pool.allocate_today()
++    _check(day1["status"] == "SHORTFALL", "empty day reported as shortfall")
++    return {"version": SUBSTRATE_VERSION,
++            "assumptions": "synthetic inventory and policy targets",
++            "earned_credits": amount,
++            "nonworker_credits": pods[3].transit_credit_balance,
++            "day_0": day0, "day_1": day1,
++            "result": "equal basic-needs allocation despite unequal earned credits"}
++
++
+ def municipal_demo() -> None:
+     print("=" * 88)
+     print("MUNICIPAL DEMO — Fragility-scaled tolling")
+@@ -1867,8 +2244,8 @@
+ 
+ 
+ # ===========================================================================
+-# Built-in tests (v7 suite, updated where v8 intentionally changed behaviour;
+-# the full regression suite is test_substrate_v8.py)
++# Built-in tests (v7 suite, updated where v8/v9 intentionally changed
++# behaviour; the full regression suite is test_substrate_v9.py)
+ # ===========================================================================
+ def _check(cond: bool, msg: str) -> None:
+     if not cond:
+@@ -1876,17 +2253,26 @@
+ 
+ 
+ def run_unit_tests() -> None:
+-    print("Running substrate v8 built-in test suite...")
++    print("Running substrate v9 built-in test suite...")
+ 
+     # Max provenance. CHANGED: v7 used sensor_variance=1.0; v8 scores
+     # plausibility, so an in-band variance gives quality 1.0.
++    # CHANGED v9: minting needs a mesh receipt from a shared registry.
+     log = TransparencyLog()
+-    agi = AGIDataEngine(transparency_log=log)
++    treg, tclock, tgraph, tpods = _toy_world(4, polity="")
++    tmesh = MeshConsensus(registry=treg, clock=tclock, graph=tgraph)
++    agi = ContributionEngine(transparency_log=log, mesh=tmesh, registry=treg)
+     prov_max = ProvenanceEvidence(sensor_variance=0.3, quorum_attestations=3)
+-    _check(abs(prov_max.combined_entropy - 1.0) < 1e-9, "max provenance = 1.0")
++    _check(abs(prov_max.provenance_score - 1.0) < 1e-9, "max provenance = 1.0")
++    rcpt = tmesh.register(tpods[0], "community_care", 1.0, tpods[1:],
++                          activity_id="builtin-1")
+     act = MammalianActivity(domain="community_care", description="test",
+                             hours_logged=1.0, provenance=prov_max,
+-                            peer_consensus_rating=1.0, pod_id="P", polity="")
++                            peer_consensus_rating=1.0, pod_id="pod-0",
++                            person_id="person-0", polity="",
++                            metadata={"claim_ref": rcpt["claim_ref"]})
++    _check(ContributionEngine().evaluate_and_mint(act)[0] == 0,
++           "no mesh -> no mint")
+     credits, err = agi.evaluate_and_mint(act)
+     _check(err is None, "max provenance accepted")
+     _check(abs(credits - 36.0) < 1e-6, f"expected 36.0, got {credits}")
+@@ -1909,17 +2295,22 @@
+     r = reg.register("p2", "same", sponsors=["g1", "g2"])
+     _check(r["status"] == "FAILED", "sybil rejected")
+ 
+-    # Mesh neighbor rule. CHANGED: neighbors via the mutual NeighborGraph.
+-    pods = [HouseholdPod(f"P{i}") for i in range(5)]
+-    g = NeighborGraph()
+-    for p in pods:
+-        g.register_pod(p.node_id)
+-    for n in ("P1", "P2", "P3"):
+-        g.link("P0", n)
+-    mesh = MeshConsensus(quorum=3, rate_limit_per_hour=2, graph=g)
+-    r = mesh.register(pods[0], "community_care", 4.0, pods[1:5], hour=1)
++    # Mesh neighbor rule. CHANGED: neighbors via the mutual NeighborGraph;
++    # v9: registry-bound pods and an activity_id.
++    mreg, mclock, g, pods = _toy_world(5)
++    g._edges.discard(frozenset(("pod-0", "pod-4")))     # pod-4: not a neighbor
++    mesh = MeshConsensus(quorum=3, rate_limit_per_hour=2, graph=g,
++                         clock=mclock, registry=mreg)
++    r = mesh.register(pods[0], "community_care", 4.0, pods[1:5], hour=1,
++                      activity_id="builtin-mesh")
+     _check(r["quorum_met"], "quorum met")
+-    _check("P4" not in r["accepted"], "non-neighbor rejected")
++    _check("pod-4" not in r["accepted"], "non-neighbor rejected")
++    r = mesh.register(pods[0], "community_care", 1.0, [pods[1]] * 3,
++                      activity_id="builtin-dup")
++    _check(not r["quorum_met"], "duplicate peer counts once")
++
++    # v9 basic needs: equal physical allocation regardless of credits
++    basic_needs_exercise()
+ 
+     robust = MunicipalZone("R", 100.0, 100, 85, ecological_fragility=0.5)
+     fragile = MunicipalZone("F", 100.0, 100, 85, ecological_fragility=2.0)
+@@ -2010,6 +2401,8 @@
+     p.add_argument("--test", action="store_true")
+     p.add_argument("--municipal-demo", action="store_true")
+     p.add_argument("--pod-report", action="store_true")
++    p.add_argument("--basic-needs", action="store_true",
++                   help="JSON of the v9 basic-needs/receipt integration run")
+     args = p.parse_args()
+ 
+     if args.test:
+@@ -2029,6 +2422,10 @@
+         print(json.dumps(pod_report(out=lambda *_: None), indent=2))
+         return
+ 
++    if args.basic_needs:
++        print(json.dumps(basic_needs_exercise(), indent=2))
++        return
++
+     demo()
+ 
+ 
